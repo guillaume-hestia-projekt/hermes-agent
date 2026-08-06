@@ -644,6 +644,20 @@ def _format_exec_approval_fallback(
     )
 
 
+def _supports_mcp_url_elicitation(adapter: object) -> bool:
+    """Whether a messaging adapter can approve and deliver an exact URL."""
+    adapter_type = type(adapter)
+    return bool(
+        getattr(adapter_type, "supports_mcp_url_elicitation", False)
+        and callable(
+            getattr(adapter_type, "send_exec_approval", None)
+        )
+        and callable(
+            getattr(adapter_type, "send_mcp_elicitation_url", None)
+        )
+    )
+
+
 def _gateway_provider_error_reply(text: str) -> str:
     """Map raw provider/API errors to a short user-safe Telegram reply."""
     if _GATEWAY_AUTH_ERROR_RE.search(text):
@@ -5317,6 +5331,51 @@ class TurnRunner:
                 UX.  Otherwise fall back to a plain text message with
                 ``/approve`` instructions.
                 """
+            if approval_data.get("kind") == "mcp.elicitation.url":
+                # This callback invocation happens only after the one-shot
+                # approval resolved. Sending the link in a separate message
+                # makes the pre-consent approval non-clickable and prevents
+                # chat-platform unfurlers from touching it beforehand.
+                _url = str(approval_data.get("url") or "")
+                _server = " ".join(
+                    str(approval_data.get("server_name") or "unknown server").split()
+                )[:200]
+                _server = re.sub(r"[^\w.\-/]", "?", _server) or "unknown server"
+                _link_metadata = dict(ctx._status_thread_metadata or {})
+                _link_metadata.update({
+                    "nonconversational": True,
+                    "require_full_content": True,
+                    "suppress_link_preview": True,
+                })
+                _url_sender = getattr(
+                    type(ctx._status_adapter),
+                    "send_mcp_elicitation_url",
+                    None,
+                )
+                if _url_sender is None:
+                    raise RuntimeError(
+                        "Messaging platform lacks verbatim MCP URL delivery"
+                    )
+                _link_fut = safe_schedule_threadsafe(
+                    ctx._status_adapter.send_mcp_elicitation_url(
+                        chat_id=ctx._status_chat_id,
+                        metadata=_link_metadata,
+                        server_name=_server,
+                        url=_url,
+                    ),
+                    ctx._loop_for_step,
+                    logger=logger,
+                    log_message="MCP elicitation URL scheduling error",
+                )
+                if _link_fut is None:
+                    raise RuntimeError("MCP elicitation URL: loop unavailable")
+                _link_result = _link_fut.result(timeout=15)
+                if not _link_result.success:
+                    raise RuntimeError(
+                        f"MCP elicitation URL send failed: {_link_result.error}"
+                    )
+                return
+
             # Pause the typing indicator while the agent waits for
             # user approval.  Critical for Slack's Assistant API where
             # assistant_threads_setStatus disables the compose box — the
@@ -5328,6 +5387,18 @@ class TurnRunner:
 
             cmd = approval_data.get("command", "")
             desc = approval_data.get("description", "dangerous command")
+            _is_url_elicitation = approval_data.get("elicitation_mode") == "url"
+            _approval_metadata = dict(ctx._status_thread_metadata or {})
+            if _is_url_elicitation:
+                if not _supports_mcp_url_elicitation(ctx._status_adapter):
+                    raise RuntimeError(
+                        "This messaging platform cannot guarantee full, "
+                        "non-prefetched MCP URL approval"
+                    )
+                _approval_metadata.update({
+                    "require_full_command": True,
+                    "suppress_link_preview": True,
+                })
 
             # Redact credentials from the command before displaying it in
             # the approval prompt — Tirith's findings are already redacted,
@@ -5335,12 +5406,16 @@ class TurnRunner:
             # platform (#48456). Applied here so BOTH the button-based
             # (send_exec_approval) and plain-text fallback paths below use
             # the redacted value.
-            cmd = _redact_approval_command(cmd)
+            if not _is_url_elicitation:
+                cmd = _redact_approval_command(cmd)
 
             # Prefer button-based approval when the adapter supports it.
             # Check the *class* for the method, not the instance — avoids
             # false positives from MagicMock auto-attribute creation in tests.
-            if getattr(type(ctx._status_adapter), "send_exec_approval", None) is not None:
+            _native_approval = getattr(
+                type(ctx._status_adapter), "send_exec_approval", None
+            )
+            if _native_approval is not None:
                 try:
                     _approval_fut = safe_schedule_threadsafe(
                         ctx._status_adapter.send_exec_approval(
@@ -5348,7 +5423,7 @@ class TurnRunner:
                             command=cmd,
                             session_key=_approval_session_key,
                             description=desc,
-                            metadata=ctx._status_thread_metadata,
+                            metadata=_approval_metadata,
                             allow_permanent=approval_data.get("allow_permanent", True),
                             allow_session=approval_data.get("allow_session", True),
                             smart_denied=approval_data.get("smart_denied", False),
@@ -5362,14 +5437,25 @@ class TurnRunner:
                     _approval_result = _approval_fut.result(timeout=15)
                     if _approval_result.success:
                         return
+                    if _is_url_elicitation:
+                        raise RuntimeError(
+                            "URL elicitation approval could not be displayed in full"
+                        )
                     logger.warning(
                         "Button-based approval failed (send returned error), falling back to text: %s",
                         _approval_result.error,
                     )
                 except Exception as _e:
+                    if _is_url_elicitation:
+                        raise
                     logger.warning(
                         "Button-based approval failed, falling back to text: %s", _e
                     )
+
+            if _is_url_elicitation:
+                raise RuntimeError(
+                    "MCP URL elicitation requires a safe native approval surface"
+                )
 
             # Fallback: plain text approval prompt.  Use the adapter's
             # typed prefix so Slack/Matrix users are told the form they
@@ -5389,7 +5475,7 @@ class TurnRunner:
                     ctx._status_adapter.send(
                         ctx._status_chat_id,
                         msg,
-                        metadata=ctx._status_thread_metadata,
+                        metadata=_approval_metadata,
                     ),
                     ctx._loop_for_step,
                     logger=logger,

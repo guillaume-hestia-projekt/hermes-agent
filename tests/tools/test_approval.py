@@ -658,6 +658,56 @@ class TestSmartDeniedPrompt:
         assert "b/R" in prompts[0]
 
 
+class TestOnceOnlyPrompt:
+    def test_callback_receives_once_only_capability(self):
+        captured = {}
+
+        def callback(command, description, **kwargs):
+            captured.update(kwargs)
+            return "once"
+
+        result = prompt_dangerous_approval(
+            "https://auth.example.test/connect",
+            "Open external URL",
+            allow_permanent=False,
+            once_only=True,
+            approval_callback=callback,
+        )
+
+        assert result == "once"
+        assert captured == {"allow_permanent": False, "once_only": True}
+
+    def test_url_display_can_preserve_credential_shaped_query(self):
+        seen = {}
+        url = "https://auth.example.test/connect?api_key=sk-not-a-client-secret"
+
+        def callback(command, description, **kwargs):
+            seen["command"] = command
+            return "deny"
+
+        prompt_dangerous_approval(
+            url,
+            "Open external URL",
+            allow_permanent=False,
+            once_only=True,
+            redact_command=False,
+            approval_callback=callback,
+        )
+
+        assert seen["command"] == url
+
+    def test_once_only_rejects_session_input(self):
+        with mock_patch("builtins.input", return_value="session"):
+            result = prompt_dangerous_approval(
+                "https://auth.example.test/connect",
+                "Open external URL",
+                allow_permanent=False,
+                once_only=True,
+            )
+
+        assert result == "deny"
+
+
 class TestForkBombDetection:
     """The fork bomb regex must match the classic :(){ :|:& };: pattern."""
 

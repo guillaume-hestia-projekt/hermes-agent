@@ -33,7 +33,7 @@ function part(toolName: string): ToolPart {
 function setRequest(
   command = 'rm -rf /tmp/x',
   allowPermanent?: boolean,
-  extra: { choices?: string[]; smartDenied?: boolean } = {}
+  extra: { choices?: string[]; elicitationMode?: 'url'; serverName?: string; smartDenied?: boolean } = {}
 ) {
   $activeSessionId.set('sess-1')
   setApprovalRequest({ allowPermanent, command, description: 'dangerous command', sessionId: 'sess-1', ...extra })
@@ -153,6 +153,54 @@ describe('PendingToolApproval', () => {
     expect(screen.getByRole('button', { name: /Run/ })).toBeTruthy()
     expect(screen.getByRole('button', { name: /Reject/ })).toBeTruthy()
     expect(screen.queryByRole('button', { name: /More approval options/ })).toBeNull()
+  })
+
+  it('shows the complete MCP URL and requester before offering to open it', () => {
+    const url = `https://auth.example.test/authorize?state=${'x'.repeat(600)}`
+    setRequest(url, false, {
+      choices: ['once', 'deny'],
+      elicitationMode: 'url',
+      serverName: 'workspace'
+    })
+    const { container } = render(<PendingApprovalFallback />)
+
+    expect(screen.getByText(url)).toBeTruthy()
+    expect(screen.getByText(/Requested by MCP server “workspace”/)).toBeTruthy()
+    expect(screen.getByText(/Target: auth\.example\.test/)).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Open URL/ })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /Command/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: /More approval options/ })).toBeNull()
+    expect(container.querySelector('[data-slot="mcp-url-elicitation"] pre')?.getAttribute('dir')).toBe('ltr')
+  })
+
+  it('never offers session or permanent approval for URL mode without choices', () => {
+    setRequest('https://auth.example.test/authorize?state=opaque', false, {
+      elicitationMode: 'url',
+      serverName: 'workspace'
+    })
+    render(<PendingApprovalFallback />)
+
+    expect(screen.getByRole('button', { name: /Open URL/ })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /More approval options/ })).toBeNull()
+    expect(screen.queryByText(/Allow this session/)).toBeNull()
+    expect(screen.queryByText(/Always allow/)).toBeNull()
+  })
+
+  it.each(['', '\u200b', 'http://example.test/connect'])('does not approve invalid URL-mode target %j', command => {
+    const request = mockGateway()
+    setRequest(command, false, {
+      choices: ['once', 'deny'],
+      elicitationMode: 'url',
+      serverName: 'workspace'
+    })
+    render(<PendingApprovalFallback />)
+
+    const openButton = screen.getByRole('button', { name: /Open URL/ }) as HTMLButtonElement
+
+    expect(openButton.disabled).toBe(true)
+    fireEvent.click(openButton)
+    fireEvent.keyDown(window, { ctrlKey: true, key: 'Enter' })
+    expect(request).not.toHaveBeenCalled()
   })
 
   it('renders a floating fallback when no pending tool row is mounted', () => {

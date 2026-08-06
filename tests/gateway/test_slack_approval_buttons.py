@@ -139,6 +139,76 @@ class TestSlackExecApproval:
         ]
         assert "one operation" in kwargs["blocks"][0]["text"]["text"].lower()
 
+    @pytest.mark.asyncio
+    async def test_mcp_url_approval_is_complete_and_suppresses_unfurls(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "1234.5678"})
+        url = "https://auth.example.test/connect?state=opaque"
+
+        result = await adapter.send_exec_approval(
+            chat_id="C1",
+            command=url,
+            session_key="mcp-url",
+            description="MCP server workspace requested this external page",
+            metadata={
+                "require_full_command": True,
+                "suppress_link_preview": True,
+                "slack_team_id": "T1",
+            },
+            allow_permanent=False,
+            allow_session=False,
+        )
+
+        assert result.success is True
+        assert adapter.supports_mcp_url_elicitation is True
+        kwargs = mock_client.chat_postMessage.call_args.kwargs
+        assert url in kwargs["blocks"][0]["text"]["text"]
+        assert kwargs["unfurl_links"] is False
+        assert kwargs["unfurl_media"] is False
+
+    @pytest.mark.asyncio
+    async def test_mcp_url_approval_fails_instead_of_truncating(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "1234.5678"})
+
+        result = await adapter.send_exec_approval(
+            chat_id="C1",
+            command="https://auth.example.test/" + "a" * 3000,
+            session_key="mcp-url",
+            metadata={"require_full_command": True, "slack_team_id": "T1"},
+            allow_permanent=False,
+            allow_session=False,
+        )
+
+        assert result.success is False
+        assert "full" in (result.error or "")
+        mock_client.chat_postMessage.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_post_consent_link_is_verbatim_and_suppresses_unfurls(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "1234.5678"})
+        url = "https://auth.example.test/connect?state=abc_def&return=%2Fdone"
+
+        result = await adapter.send_mcp_elicitation_url(
+            chat_id="C1",
+            metadata={
+                "slack_team_id": "T1",
+            },
+            server_name="workspace",
+            url=url,
+        )
+
+        assert result.success is True
+        kwargs = mock_client.chat_postMessage.call_args.kwargs
+        assert kwargs["mrkdwn"] is False
+        assert kwargs["text"].endswith(url)
+        assert kwargs["unfurl_links"] is False
+        assert kwargs["unfurl_media"] is False
+
 
 # ===========================================================================
 # _handle_approval_action — button click handler
@@ -840,4 +910,3 @@ class TestSlackReactionAuthorizationGate:
         assert "U_RANDO" in runner.auth_checked
         assert runner.handled == []
         adapter.handle_message.assert_not_called()
-

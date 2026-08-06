@@ -2534,6 +2534,12 @@ class SlackAdapter(BasePlatformAdapter):
 
             # Split long messages, preserving code block boundaries
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            if (metadata or {}).get("require_full_content") and len(chunks) != 1:
+                return SendResult(
+                    success=False,
+                    error="Message cannot be displayed in full on Slack",
+                    retryable=False,
+                )
 
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
             last_result = None
@@ -2555,6 +2561,8 @@ class SlackAdapter(BasePlatformAdapter):
                     "text": chunk,
                     "mrkdwn": True,
                 }
+                if (metadata or {}).get("suppress_link_preview"):
+                    kwargs.update({"unfurl_links": False, "unfurl_media": False})
                 if blocks and i == 0:
                     kwargs["blocks"] = blocks
                 if thread_ts:
@@ -6366,6 +6374,58 @@ class SlackAdapter(BasePlatformAdapter):
 
     # ----- Approval button support (Block Kit) -----
 
+    supports_mcp_url_elicitation = True
+
+    async def send_mcp_elicitation_url(
+        self,
+        *,
+        chat_id: str,
+        url: str,
+        server_name: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Deliver the approved URL verbatim with Slack unfurls disabled."""
+        if not self._app:
+            return SendResult(success=False, error="Not connected")
+
+        chat_id = await self._ensure_dm_conversation(
+            chat_id,
+            team_id=self._metadata_team_id(metadata),
+        )
+        text = f"Open the external page requested by MCP server {server_name}:\n{url}"
+        if len(text) > self.MAX_MESSAGE_LENGTH:
+            return SendResult(
+                success=False,
+                error="MCP URL cannot be delivered in full on Slack",
+                retryable=False,
+            )
+
+        try:
+            kwargs: Dict[str, Any] = {
+                "channel": chat_id,
+                "link_names": False,
+                "mrkdwn": False,
+                "text": text,
+                "unfurl_links": False,
+                "unfurl_media": False,
+            }
+            thread_ts = self._resolve_thread_ts(None, metadata)
+            if thread_ts:
+                kwargs["thread_ts"] = thread_ts
+
+            result = await self._get_client(
+                chat_id,
+                team_id=self._metadata_team_id(metadata),
+            ).chat_postMessage(**kwargs)
+            return SendResult(
+                success=True,
+                message_id=result.get("ts", ""),
+                raw_response=result,
+            )
+        except Exception as exc:
+            logger.error("[Slack] MCP URL delivery failed: %s", exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
+
     async def send_exec_approval(
         self,
         chat_id: str,
@@ -6403,6 +6463,12 @@ class SlackAdapter(BasePlatformAdapter):
                 header += "*Smart DENY:* owner override applies to this one operation only.\n"
             reason = f"Reason: {description[:500]}"
             budget = 3000 - len(header) - len(reason) - len("``````\n") - len("...")
+            if (metadata or {}).get("require_full_command") and len(command) > budget:
+                return SendResult(
+                    success=False,
+                    error="Approval URL cannot be displayed in full on Slack",
+                    retryable=False,
+                )
             cmd_preview = command[:budget] + "..." if len(command) > budget else command
 
             actions = [
@@ -6451,6 +6517,8 @@ class SlackAdapter(BasePlatformAdapter):
                 "text": f"⚠️ Command approval required: {cmd_preview[:100]}",
                 "blocks": sanitize_blocks(blocks),
             }
+            if (metadata or {}).get("suppress_link_preview"):
+                kwargs.update({"unfurl_links": False, "unfurl_media": False})
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
 

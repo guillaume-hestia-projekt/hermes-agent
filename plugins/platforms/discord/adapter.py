@@ -3101,6 +3101,12 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
+                if (metadata or {}).get("suppress_link_preview"):
+                    return SendResult(
+                        success=False,
+                        error="Cannot suppress link previews in a Discord forum post",
+                        retryable=False,
+                    )
                 result = await self._send_to_forum(channel, content)
                 await asyncio.to_thread(
                     self._record_discord_response,
@@ -3114,6 +3120,12 @@ class DiscordAdapter(BasePlatformAdapter):
             # Format and split message if needed
             formatted = self.format_message(content)
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            if (metadata or {}).get("require_full_content") and len(chunks) != 1:
+                return SendResult(
+                    success=False,
+                    error="Message cannot be displayed in full on Discord",
+                    retryable=False,
+                )
 
             message_ids = []
             # Build the reference from ids — no fetch_message round trip.
@@ -3125,10 +3137,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
                 try:
-                    msg = await channel.send(
-                        content=chunk,
-                        reference=chunk_reference,
-                    )
+                    send_kwargs: Dict[str, Any] = {
+                        "content": chunk,
+                        "reference": chunk_reference,
+                    }
+                    if (metadata or {}).get("suppress_link_preview"):
+                        send_kwargs["suppress_embeds"] = True
+                    msg = await channel.send(**send_kwargs)
                 except Exception as e:
                     err_text = str(e)
                     if (
@@ -3147,10 +3162,13 @@ class DiscordAdapter(BasePlatformAdapter):
                             reply_to,
                         )
                         reference = None
-                        msg = await channel.send(
-                            content=chunk,
-                            reference=None,
-                        )
+                        retry_kwargs: Dict[str, Any] = {
+                            "content": chunk,
+                            "reference": None,
+                        }
+                        if (metadata or {}).get("suppress_link_preview"):
+                            retry_kwargs["suppress_embeds"] = True
+                        msg = await channel.send(**retry_kwargs)
                     else:
                         raise
                 message_ids.append(str(msg.id))
@@ -7050,6 +7068,67 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
         return " ".join(f"<@{uid}>" for uid in user_ids)
 
+    supports_mcp_url_elicitation = True
+
+    async def send_mcp_elicitation_url(
+        self,
+        *,
+        chat_id: str,
+        url: str,
+        server_name: str,
+        metadata: Optional[dict] = None,
+    ) -> SendResult:
+        """Deliver the approved URL verbatim with Discord embeds disabled."""
+        if not self._client or not DISCORD_AVAILABLE:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            target_id = metadata.get("thread_id") if metadata else None
+            target_id = target_id or chat_id
+            channel = self._client.get_channel(int(target_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(target_id))
+            if not channel or self._is_forum_parent(channel):
+                return SendResult(
+                    success=False,
+                    error="MCP URL delivery requires a Discord message channel",
+                    retryable=False,
+                )
+
+            content = (
+                f"Open the external page requested by MCP server "
+                f"{server_name}:\n{url}"
+            )
+            if len(content) > self.MAX_MESSAGE_LENGTH:
+                return SendResult(
+                    success=False,
+                    error="MCP URL cannot be delivered in full on Discord",
+                    retryable=False,
+                )
+
+            send_kwargs: Dict[str, Any] = {
+                "content": content,
+                "suppress_embeds": True,
+            }
+            allowed_mentions_cls = getattr(discord, "AllowedMentions", None)
+            if allowed_mentions_cls is not None:
+                none_factory = getattr(allowed_mentions_cls, "none", None)
+                if callable(none_factory):
+                    send_kwargs["allowed_mentions"] = none_factory()
+
+            msg = await channel.send(**send_kwargs)
+            if _metadata_marks_nonconversational(metadata):
+                self._nonconversational_messages.mark_many([str(msg.id)])
+            return SendResult(success=True, message_id=str(msg.id))
+        except Exception as exc:
+            logger.error(
+                "[%s] MCP URL delivery failed: %s",
+                self.name,
+                exc,
+                exc_info=True,
+            )
+            return SendResult(success=False, error=str(exc))
+
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
@@ -7102,6 +7181,12 @@ class DiscordAdapter(BasePlatformAdapter):
             command_budget = max(0, self.MAX_MESSAGE_LENGTH - len(prompt_prefix) - len(prompt_tail))
             content_cmd_display = str(command or "")
             if len(content_cmd_display) > command_budget:
+                if (metadata or {}).get("require_full_command"):
+                    return SendResult(
+                        success=False,
+                        error="Approval URL cannot be displayed in full on Discord",
+                        retryable=False,
+                    )
                 content_cmd_display = (
                     content_cmd_display[: max(0, command_budget - len(truncated_suffix))]
                     + truncated_suffix
@@ -7136,6 +7221,11 @@ class DiscordAdapter(BasePlatformAdapter):
             )
 
             send_kwargs: Dict[str, Any] = {"content": content, "embed": embed, "view": view}
+            if (metadata or {}).get("suppress_link_preview"):
+                # The plain content already contains the complete URL. Avoid
+                # both automatic URL embeds and an unnecessary rich duplicate.
+                send_kwargs.pop("embed", None)
+                send_kwargs["suppress_embeds"] = True
             if mention_content:
                 allowed_mentions_cls = getattr(discord, "AllowedMentions", None)
                 if allowed_mentions_cls is not None:

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { approvalAction, approvalOptions } from '../components/prompts.js'
+import { approvalAction, approvalOptions, approvalPreview } from '../components/prompts.js'
 
 describe('approvalAction — pure key dispatch for ApprovalPrompt', () => {
   it('maps Esc to deny — parity with global Ctrl+C cancellation', () => {
@@ -81,5 +81,37 @@ describe('approvalAction — pure key dispatch for ApprovalPrompt', () => {
         description: 'blocked'
       })
     ).toEqual(['once', 'deny'])
+  })
+
+  it('forces URL mode to once or deny when transport choices are absent', () => {
+    expect(
+      approvalOptions({
+        allowPermanent: false,
+        command: 'https://auth.example.test/connect',
+        description: 'external interaction',
+        elicitationMode: 'url'
+      })
+    ).toEqual(['once', 'deny'])
+  })
+})
+
+describe('approvalPreview', () => {
+  it('never truncates a URL-mode target before consent', () => {
+    const command = `https://auth.example.test/connect?state=${'x'.repeat(1200)}`
+
+    const preview = approvalPreview(
+      {
+        choices: ['once', 'deny'],
+        command,
+        description: 'external interaction',
+        elicitationMode: 'url',
+        serverName: 'workspace'
+      },
+      80
+    )
+
+    expect(preview.overflow).toBe(0)
+    expect(preview.shown.join('')).toBe(command)
+    expect(preview.shown.length).toBeGreaterThan(10)
   })
 })

@@ -105,6 +105,72 @@ class TestTelegramExecApproval:
         assert "dangerous deletion" in kwargs["text"]
         assert kwargs["reply_markup"] is not None  # InlineKeyboardMarkup
 
+    @pytest.mark.asyncio
+    async def test_mcp_url_approval_is_complete_and_disables_link_preview(self):
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=42))
+        url = "https://auth.example.test/connect?state=opaque"
+
+        result = await adapter.send_exec_approval(
+            chat_id="12345",
+            command=url,
+            session_key="mcp-url",
+            description="MCP server workspace requested this external page",
+            metadata={"require_full_command": True, "suppress_link_preview": True},
+            allow_permanent=False,
+            allow_session=False,
+        )
+
+        assert result.success is True
+        assert adapter.supports_mcp_url_elicitation is True
+        kwargs = adapter._bot.send_message.call_args.kwargs
+        assert url in kwargs["text"]
+        assert (
+            kwargs.get("disable_web_page_preview") is True
+            or kwargs.get("link_preview_options") is not None
+        )
+
+    @pytest.mark.asyncio
+    async def test_mcp_url_approval_fails_instead_of_truncating(self):
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=42))
+
+        result = await adapter.send_exec_approval(
+            chat_id="12345",
+            command="https://auth.example.test/" + "a" * 3900,
+            session_key="mcp-url",
+            metadata={"require_full_command": True, "suppress_link_preview": True},
+            allow_permanent=False,
+            allow_session=False,
+        )
+
+        assert result.success is False
+        assert "full" in (result.error or "")
+        adapter._bot.send_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_post_consent_link_is_verbatim_and_disables_preview(self):
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=42))
+        url = "https://auth.example.test/connect?state=abc_def&return=%2Fdone"
+
+        result = await adapter.send_mcp_elicitation_url(
+            chat_id="12345",
+            metadata={},
+            server_name="workspace",
+            url=url,
+        )
+
+        assert result.success is True
+        kwargs = adapter._bot.send_message.call_args.kwargs
+        assert kwargs["parse_mode"] is None
+        assert kwargs["text"].endswith(url)
+        assert "abc\\_def" not in kwargs["text"]
+        assert (
+            kwargs.get("disable_web_page_preview") is True
+            or kwargs.get("link_preview_options") is not None
+        )
+
 
     @pytest.mark.asyncio
     async def test_non_smart_allow_permanent_false_keeps_session(self, monkeypatch):
@@ -359,4 +425,3 @@ class TestTelegramApprovalCallback:
         assert runner.last_source is not None
         assert runner.last_source.platform == Platform.TELEGRAM
         assert runner.last_source.user_id == "222"
-

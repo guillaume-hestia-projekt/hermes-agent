@@ -774,7 +774,15 @@ mcp_servers:
 
 ## MCP Elicitation Support
 
-MCP servers can ask the user for structured input mid-tool-call via the `elicitation/create` protocol (mcp Python SDK ≥ 1.11.0). Hermes routes **form-mode** elicitations through its existing approval surface — an interactive prompt in the CLI/TUI, or approval buttons on gateway platforms like Telegram and Slack — so the request reaches you wherever the session lives. **URL-mode** elicitations (where a server points you at an external URL) are declined as unsupported.
+MCP servers can ask the user for structured input mid-tool-call via the `elicitation/create` protocol (mcp Python SDK ≥ 1.11.0). Hermes routes **form-mode** elicitations through its existing approval surface — an interactive prompt in the CLI/TUI, or approval buttons on gateway platforms like Telegram and Slack — so the request reaches you wherever the session lives.
+
+Hermes also supports **URL mode** for sensitive out-of-band interactions such as OAuth or payment authorization. Before navigation, the approval surface identifies the requesting MCP server, highlights the target host, and shows the complete URL. The URL is opened or delivered only after a one-shot approval; session and permanent approval are unavailable. Hermes never fetches the URL or its metadata, never sends browser contents back to the model, and returns URL-mode `accept` without an in-band `content` field.
+
+URL mode is available in the CLI, TUI, Desktop app, API event stream, Telegram, Slack, and Discord. Other messaging adapters decline URL-mode requests until they can guarantee a complete, non-prefetched approval display.
+
+API clients must treat `approval.request` as display-only and must not navigate until the later `mcp.elicitation.url` event. A client that cannot open that event securely should deny the approval instead of returning `once`.
+
+URL targets must use HTTPS. Plain HTTP is accepted only for `localhost` or a literal loopback IP during local development. URLs with user information, unsafe schemes, control characters, or ambiguous rendering characters are declined. If the user refuses, the approval expires, or the host surface cannot present the URL, Hermes fails closed.
 
 Elicitation is **enabled by default** per server. Configure it under the `elicitation` key:
 
@@ -788,6 +796,8 @@ mcp_servers:
 ```
 
 The 5-minute default timeout mirrors the gateway approval default so users on async surfaces have time to respond before the server gives up. Per-server metrics (requests, accepted, declined, errors) are tracked on the handler.
+
+URL mode is for authorization between the MCP server and an external service. It does not replace OAuth between Hermes and the MCP server, and credentials entered in the external browser must remain outside Hermes.
 
 ## Running Hermes as an MCP server
 

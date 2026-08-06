@@ -703,10 +703,17 @@ export type GatewayEvent =
         choices?: string[]
         command: string
         description: string
+        elicitation_mode?: 'url'
+        server_name?: string
         smart_denied?: boolean
       }
       session_id?: string
       type: 'approval.request'
+    }
+  | {
+      payload: { message?: string; server_name: string; url: string }
+      session_id?: string
+      type: 'mcp.elicitation.url'
     }
   | { payload: { request_id: string }; session_id?: string; type: 'sudo.request' }
   | { payload: { env_var: string; prompt: string; request_id: string }; session_id?: string; type: 'secret.request' }

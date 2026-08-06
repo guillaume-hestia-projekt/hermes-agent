@@ -2369,11 +2369,15 @@ export interface Translations {
       gatewayDisconnected: string
       sendFailed: string
       run: string
+      openUrl: string
       command: string
       moreOptions: string
       allowSession: string
       alwaysAllowMenu: string
       jumpToApproval: string
+      unknownServer: string
+      requestedBy: (server: string) => string
+      targetHost: (host: string) => string
       reject: string
       alwaysTitle: string
       alwaysDescription: (pattern: string) => string

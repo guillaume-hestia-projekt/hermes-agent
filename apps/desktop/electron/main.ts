@@ -91,6 +91,7 @@ import {
 import { describeDevCdpDecision, resolveDevCdpPort } from './dev-cdp'
 import { installEmbedReferer } from './embed-referer'
 import { createEventDeduper } from './event-dedupe'
+import { externalOpenTarget, safeMcpElicitationUrl, wslExternalOpenCommand } from './external-open'
 import { findGitBash as _findGitBash } from './find-git-bash'
 import { installFoundInPageForwarder, performFind, stopFind } from './find-in-page'
 import { createFirstRunSetupGate } from './first-run-setup-gate'
@@ -1304,8 +1305,9 @@ function loadWindowUrl(win, url, label) {
   win.loadURL(url).catch(error => rememberLog(`${label} failed to load: ${describeCrashReason(error)}`))
 }
 
-function openExternalUrl(rawUrl) {
-  const raw = String(rawUrl || '').trim()
+function openExternalUrl(rawUrl, { preserveRaw = false } = {}) {
+  const rawInput = String(rawUrl || '')
+  const raw = preserveRaw ? rawInput : rawInput.trim()
 
   if (!raw) {
     return false
@@ -1357,19 +1359,26 @@ function openExternalUrl(rawUrl) {
     return false
   }
 
-  const url = parsed.toString()
+  const url = externalOpenTarget(raw, parsed, preserveRaw)
 
   if (IS_WSL) {
-    rememberLog(`[link] opening via WSL→Windows: ${url}`)
+    const safeLogTarget = parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.origin : parsed.protocol
 
-    const proc = spawn('cmd.exe', ['/c', 'start', '""', url], {
+    rememberLog(`[link] opening via WSL→Windows: ${safeLogTarget}`)
+
+    // Never route URLs through `cmd.exe /c start`: cmd reparses `&`, `|`,
+    // carets and redirections inside ordinary OAuth query strings. Explorer
+    // invokes the registered Windows URL handler with one argv element.
+    const opener = wslExternalOpenCommand(url)
+
+    const proc = spawn(opener.command, opener.args, {
       detached: true,
       stdio: 'ignore',
       windowsHide: true
     })
 
     proc.on('error', error => {
-      rememberLog(`[link] cmd.exe start failed: ${error.message}; falling back to xdg-open`)
+      rememberLog(`[link] explorer.exe failed: ${error.message}; falling back to xdg-open`)
       shell.openExternal(url).catch(fallback => rememberLog(`[link] xdg-open failed: ${fallback.message}`))
     })
     proc.unref()
@@ -11405,6 +11414,14 @@ ipcMain.on('hermes:quick-entry:dismiss', () => hideQuickEntryWindow())
 ipcMain.handle('hermes:openExternal', (_event, url) => {
   if (!openExternalUrl(url)) {
     throw new Error('Invalid external URL')
+  }
+})
+
+ipcMain.handle('hermes:openMcpElicitationUrl', (_event, rawUrl) => {
+  const url = safeMcpElicitationUrl(rawUrl)
+
+  if (!url || !openExternalUrl(url, { preserveRaw: true })) {
+    throw new Error('Invalid MCP elicitation URL')
   }
 })
 

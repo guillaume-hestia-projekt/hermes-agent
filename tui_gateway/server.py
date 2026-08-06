@@ -1831,6 +1831,20 @@ def _emit_approval_request(sid: str, data: dict | None) -> None:
     platforms and the SSE/API stream fixed in #50767). Reuse the shared gateway
     seam so all approval transports redact consistently."""
     payload = dict(data or {})
+    if payload.get("kind") == "mcp.elicitation.url":
+        # Emitted only after the backend has resolved an explicit one-shot
+        # consent. Keep this separate from approval.request so clients cannot
+        # accidentally navigate while merely rendering the consent prompt.
+        _emit(
+            "mcp.elicitation.url",
+            sid,
+            {
+                "message": payload.get("message", ""),
+                "server_name": payload.get("server_name", "unknown server"),
+                "url": payload.get("url", ""),
+            },
+        )
+        return
     if "choices" not in payload:
         if payload.get("smart_denied"):
             payload["choices"] = ["once", "deny"]
@@ -1838,7 +1852,7 @@ def _emit_approval_request(sid: str, data: dict | None) -> None:
             payload["choices"] = ["once", "session", "deny"]
         elif "allow_permanent" in payload:
             payload["choices"] = ["once", "session", "always", "deny"]
-    if "command" in payload:
+    if "command" in payload and payload.get("elicitation_mode") != "url":
         from gateway.run import _redact_approval_command
 
         payload["command"] = _redact_approval_command(payload.get("command"))

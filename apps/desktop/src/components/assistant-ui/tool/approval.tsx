@@ -17,6 +17,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigge
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { AlertCircle, ChevronDown, Loader2 } from '@/lib/icons'
+import { safeMcpElicitationUrl } from '@/lib/mcp-elicitation-url'
 import { cn } from '@/lib/utils'
 import { $gateway } from '@/store/gateway'
 import { notifyError } from '@/store/notifications'
@@ -118,18 +119,42 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
   const busy = submitting !== null
   // false when the backend won't honor a permanent allow (tirith warning) → hide "Always allow".
   const allowPermanent = request.allowPermanent !== false
-  const choices = request.choices ?? (request.smartDenied ? ['once', 'deny'] : undefined)
+  const isUrlElicitation = request.elicitationMode === 'url'
+
+  const choices = isUrlElicitation
+    ? ['once', 'deny']
+    : (request.choices ?? (request.smartDenied ? ['once', 'deny'] : undefined))
+
   const allowSession = choices ? choices.includes('session') : true
   const allowAlways = choices ? choices.includes('always') : allowPermanent
   const hasMoreOptions = allowSession || allowAlways
   const hasCommand = request.command.trim().length > 0
+
+  const validatedUrl = useMemo(
+    () => (isUrlElicitation ? safeMcpElicitationUrl(request.command) : null),
+    [isUrlElicitation, request.command]
+  )
+
+  const canApprove = !isUrlElicitation || validatedUrl !== null
+
+  const targetHost = useMemo(() => {
+    if (!validatedUrl) {
+      return ''
+    }
+
+    try {
+      return new URL(validatedUrl).hostname
+    } catch {
+      return ''
+    }
+  }, [validatedUrl])
 
   const respond = useCallback(
     async (choice: ApprovalChoice) => {
       // Another bar (or the keyboard path) may have already resolved this
       // approval; the map is the single source of truth, so bail if this
       // session's request is gone.
-      if (busy || !sessionApprovalRequest(request.sessionId).get()) {
+      if (busy || (choice !== 'deny' && !canApprove) || !sessionApprovalRequest(request.sessionId).get()) {
         return
       }
 
@@ -153,7 +178,7 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
         setSubmitting(null)
       }
     },
-    [busy, copy.gatewayDisconnected, copy.sendFailed, gateway, request.sessionId]
+    [busy, canApprove, copy.gatewayDisconnected, copy.sendFailed, gateway, request.sessionId]
   )
 
   // ⌘/Ctrl+Enter → Run, Esc → Reject.
@@ -184,16 +209,42 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
       className={cn(surface === 'inline' ? 'mt-1 ps-5' : 'mt-2')}
       data-slot={surface === 'inline' ? 'tool-approval-inline' : 'tool-approval-actions'}
     >
+      {isUrlElicitation && validatedUrl && (
+        <div className="mb-2 min-w-0" data-slot="mcp-url-elicitation">
+          <p className="mb-1 text-xs text-(--ui-text-tertiary)">
+            {copy.requestedBy(request.serverName || copy.unknownServer)}
+            {targetHost && (
+              <>
+                {' · '}
+                <span className="font-medium text-foreground">{copy.targetHost(targetHost)}</span>
+              </>
+            )}
+          </p>
+          <pre
+            className="max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-md border border-(--ui-stroke-tertiary) bg-(--ui-chat-surface-background) px-2.5 py-1.5 font-mono text-xs leading-snug text-foreground"
+            dir="ltr"
+          >
+            {validatedUrl}
+          </pre>
+        </div>
+      )}
+
       <div className="flex items-center gap-2.5">
         <div className="inline-flex h-6 items-stretch overflow-hidden rounded-md border border-primary/25 bg-primary/10 text-primary">
           <Button
             className="h-full gap-1 rounded-none px-2 text-xs font-medium text-primary hover:bg-primary/15 hover:text-primary"
-            disabled={busy}
+            disabled={busy || !canApprove}
             onClick={() => void respond('once')}
             size="xs"
             variant="ghost"
           >
-            {submitting === 'once' ? <Loader2 className="size-3 animate-spin" /> : copy.run}
+            {submitting === 'once' ? (
+              <Loader2 className="size-3 animate-spin" />
+            ) : isUrlElicitation ? (
+              copy.openUrl
+            ) : (
+              copy.run
+            )}
             {submitting !== 'once' && <span className="text-[0.625rem] text-primary/60">{isMac ? '⌘⏎' : 'Ctrl⏎'}</span>}
           </Button>
           {hasMoreOptions && <span aria-hidden className="w-px self-stretch bg-primary/20" />}
@@ -245,7 +296,7 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
           {submitting !== 'deny' && <span className="text-[0.625rem] opacity-55">Esc</span>}
         </Button>
 
-        {hasCommand && (
+        {hasCommand && !isUrlElicitation && (
           <Button
             aria-expanded={showCommand}
             className="h-6 gap-1 rounded-md px-1.5 text-xs font-normal text-(--ui-text-tertiary) hover:text-foreground"
@@ -259,7 +310,7 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
         )}
       </div>
 
-      {showCommand && hasCommand && (
+      {showCommand && hasCommand && !isUrlElicitation && (
         <pre className="mt-1.5 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-md border border-(--ui-stroke-tertiary) bg-(--ui-chat-surface-background) px-2.5 py-1.5 font-mono text-xs leading-snug text-foreground">
           {request.command.trim()}
         </pre>

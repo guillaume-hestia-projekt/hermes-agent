@@ -11,8 +11,10 @@ import type { Msg } from '../types.js'
 // Mock the external-URL opener so the billing.step_up.verification test can
 // assert it's invoked without spawning a real browser process.
 const openExternalUrlMock = vi.fn((_url: string) => true)
+const openMcpElicitationUrlMock = vi.fn((_url: string) => true)
 vi.mock('../lib/openExternalUrl.js', () => ({
-  openExternalUrl: (url: string) => openExternalUrlMock(url)
+  openExternalUrl: (url: string) => openExternalUrlMock(url),
+  openMcpElicitationUrl: (url: string) => openMcpElicitationUrlMock(url)
 }))
 
 const ref = <T>(current: T) => ({ current })
@@ -1185,6 +1187,38 @@ describe('createGatewayEventHandler', () => {
     } as any)
 
     expect(getOverlayState().approval).toMatchObject({ choices: ['once', 'deny'], smartDenied: true })
+  })
+
+  it('does not open an MCP URL until the post-consent event arrives', () => {
+    const url = 'https://auth.example.test/connect?state=abc123'
+    const onEvent = createGatewayEventHandler(buildCtx([]))
+    openMcpElicitationUrlMock.mockClear()
+
+    onEvent({
+      payload: {
+        choices: ['once', 'deny'],
+        command: url,
+        description: 'MCP server workspace wants to open an external page',
+        elicitation_mode: 'url',
+        server_name: 'workspace'
+      },
+      type: 'approval.request'
+    } as any)
+
+    expect(openMcpElicitationUrlMock).not.toHaveBeenCalled()
+    expect(getOverlayState().approval).toMatchObject({
+      choices: ['once', 'deny'],
+      command: url,
+      elicitationMode: 'url',
+      serverName: 'workspace'
+    })
+
+    onEvent({
+      payload: { server_name: 'workspace', url },
+      type: 'mcp.elicitation.url'
+    } as any)
+
+    expect(openMcpElicitationUrlMock).toHaveBeenCalledWith(url)
   })
 
   it('still surfaces terminal turn failures as errors', () => {

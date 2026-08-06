@@ -18,6 +18,10 @@ const CMD_PREVIEW_LINES = 10
 type ApprovalChoice = 'always' | 'deny' | 'once' | 'session'
 
 export function approvalOptions(req: ApprovalReq): readonly ApprovalChoice[] {
+  if (req.elicitationMode === 'url') {
+    return APPROVAL_OPTS_SMART_DENY
+  }
+
   if (req.choices) {
     return req.choices.filter((choice): choice is ApprovalChoice => APPROVAL_OPTS.includes(choice as ApprovalChoice))
   }
@@ -37,6 +41,18 @@ type ApprovalKey = {
 }
 
 type ApprovalAction = { kind: 'choose'; choice: ApprovalChoice } | { kind: 'move'; delta: -1 | 1 } | { kind: 'noop' }
+
+export function approvalPreview(req: ApprovalReq, cols: number): { overflow: number; shown: string[] } {
+  const innerWidth = Math.max(20, cols - 8)
+
+  const rawLines = req.command
+    .split('\n')
+    .flatMap(line => wrapAnsi(line, innerWidth, { hard: true, trim: false }).split('\n'))
+
+  const shown = req.elicitationMode === 'url' ? rawLines : rawLines.slice(0, CMD_PREVIEW_LINES)
+
+  return { overflow: rawLines.length - shown.length, shown }
+}
 
 /**
  * Pure key-dispatch for the approval prompt — exported so the regression
@@ -97,14 +113,9 @@ export function ApprovalPrompt({ cols = 80, onChoice, req, t }: ApprovalPromptPr
   // Wrap long single-line commands to the panel width instead of clipping the
   // tail (mirrors the CLI approval panel fix — the full command must be
   // reviewable before approving). Border + paddingX + inner padding ≈ 8 cols.
-  const innerWidth = Math.max(20, cols - 8)
-
-  const rawLines = req.command
-    .split('\n')
-    .flatMap(line => wrapAnsi(line, innerWidth, { hard: true, trim: false }).split('\n'))
-
-  const shown = rawLines.slice(0, CMD_PREVIEW_LINES)
-  const overflow = rawLines.length - shown.length
+  // MCP URL mode requires the complete target before consent. Ordinary
+  // command approvals retain the bounded preview to keep the overlay usable.
+  const { overflow, shown } = approvalPreview(req, cols)
 
   return (
     <Box borderColor={t.color.warn} borderStyle="double" flexDirection="column" paddingX={1}>
@@ -132,7 +143,7 @@ export function ApprovalPrompt({ cols = 80, onChoice, req, t }: ApprovalPromptPr
         <Text key={o}>
           <Text color={t.color.muted} {...chipRowProps(t, sel === i)}>
             {sel === i ? '▸ ' : '  '}
-            {i + 1}. {LABELS[o]}
+            {i + 1}. {req.elicitationMode === 'url' && o === 'once' ? 'Open URL' : LABELS[o]}
           </Text>
         </Text>
       ))}

@@ -14,6 +14,7 @@ import { coerceGatewayText, coerceThinkingText, normalizePersonalityValue } from
 import { playCompletionSound } from '@/lib/completion-sound'
 import { resolveGatewayEventSessionId } from '@/lib/gateway-events'
 import { triggerHaptic } from '@/lib/haptics'
+import { safeMcpElicitationUrl } from '@/lib/mcp-elicitation-url'
 import { modelOptionsQueryKey } from '@/lib/model-options'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import { invalidateSlashCompletions } from '@/lib/slash-completion-cache'
@@ -984,7 +985,9 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             : undefined,
           command,
           description,
+          elicitationMode: payload?.elicitation_mode === 'url' ? 'url' : undefined,
           sessionId: sessionId ?? null,
+          serverName: typeof payload?.server_name === 'string' ? payload.server_name : undefined,
           smartDenied: payload?.smart_denied === true
         })
 
@@ -993,15 +996,31 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         }
 
         dispatchNativeNotification({
-          actions: [
-            { id: 'approve', text: translateNow('notifications.native.approveAction') },
-            { id: 'reject', text: translateNow('notifications.native.rejectAction') }
-          ],
-          body: command || description,
+          // URL mode cannot be approved from an OS notification: that surface
+          // does not show the complete URL required before consent. Clicking
+          // the notification can focus the app; the in-app approval owns the
+          // actual decision.
+          actions:
+            payload?.elicitation_mode === 'url'
+              ? undefined
+              : [
+                  { id: 'approve', text: translateNow('notifications.native.approveAction') },
+                  { id: 'reject', text: translateNow('notifications.native.rejectAction') }
+                ],
+          body: payload?.elicitation_mode === 'url' ? description : command || description,
           kind: 'approval',
           sessionId,
           title: translateNow('notifications.native.approvalTitle')
         })
+      } else if (event.type === 'mcp.elicitation.url') {
+        // This event is distinct from approval.request and is emitted by the
+        // backend only after one-shot consent. Keep navigation out of the
+        // approval-render path so merely viewing a request cannot open it.
+        const url = safeMcpElicitationUrl(typeof payload?.url === 'string' ? payload.url : '')
+
+        if (url) {
+          void window.hermesDesktop?.openMcpElicitationUrl?.(url)
+        }
       } else if (event.type === 'sudo.request') {
         // Sudo password capture (tools/terminal_tool.py). Blocked on
         // sudo.respond {request_id, password}.

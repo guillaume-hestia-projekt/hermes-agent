@@ -16,7 +16,9 @@ import hashlib
 import logging
 import os
 import re
+import shutil
 import shlex
+import subprocess
 import sys
 import tempfile
 import threading
@@ -2497,7 +2499,10 @@ def resolve_gateway_approval(session_key: str, choice: str,
     deny (``/deny <reason>``).  It is relayed back to the agent in the
     BLOCKED message so it can adapt instead of only hearing "denied".
 
-    Returns the number of approvals resolved (0 means nothing was pending).
+    Returns the number of approvals resolved with the requested choice (0
+    means nothing was pending or that the choice was disallowed). Restricted
+    entries are still unblocked as denials when the requested choice is not in
+    their explicit choice set.
     """
     with _lock:
         queue = _gateway_queues.get(session_key)
@@ -2511,12 +2516,30 @@ def resolve_gateway_approval(session_key: str, choice: str,
         if not queue:
             _gateway_queues.pop(session_key, None)
 
+    accepted_count = 0
     for entry in targets:
-        entry.result = choice
-        if reason:
+        allowed_choices = entry.data.get("choices")
+        resolved_choice = choice
+        if (
+            isinstance(allowed_choices, (list, tuple, set))
+            and choice not in allowed_choices
+        ):
+            # A typed `/approve session|always` must not bypass a one-shot
+            # prompt's button policy. Resolve as a denial so the waiter is
+            # unblocked while the restricted capability remains unopened.
+            logger.warning(
+                "Approval choice %s is not allowed for session %s; denying",
+                choice,
+                session_key,
+            )
+            resolved_choice = "deny"
+        else:
+            accepted_count += 1
+        entry.result = resolved_choice
+        if reason and resolved_choice == "deny":
             entry.reason = reason
         entry.event.set()
-    return len(targets)
+    return accepted_count
 
 
 def has_blocking_approval(session_key: str) -> bool:
@@ -2710,7 +2733,9 @@ def prompt_dangerous_approval(command: str, description: str,
                               timeout_seconds: int | None = None,
                               allow_permanent: bool = True,
                               approval_callback=None,
-                              *, smart_denied: bool = False) -> str:
+                              *, smart_denied: bool = False,
+                              once_only: bool = False,
+                              redact_command: bool = True) -> str:
     """Prompt the user to approve a dangerous command (CLI only).
 
     Args:
@@ -2719,6 +2744,12 @@ def prompt_dangerous_approval(command: str, description: str,
             is inappropriate for content-level security findings).
         smart_denied: When True, this is an owner override of a Smart DENY.
             Offer only one-operation approval or denial.
+        once_only: Offer only one-operation approval or denial without the
+            Smart DENY semantics. Used for non-repeatable actions such as
+            opening a URL-mode MCP elicitation target.
+        redact_command: Redact credential-shaped command text before display.
+            URL-mode elicitation disables this because the MCP specification
+            requires the byte-complete target to be reviewable before consent.
         approval_callback: Optional callback registered by the CLI for
             prompt_toolkit integration. Signature:
             (command, description, *, allow_permanent=True,
@@ -2745,6 +2776,8 @@ def prompt_dangerous_approval(command: str, description: str,
             allow_permanent,
             approval_callback,
             smart_denied=smart_denied,
+            once_only=once_only,
+            redact_command=redact_command,
         )
 
 
@@ -2752,13 +2785,17 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
                                      timeout_seconds: int,
                                      allow_permanent: bool = True,
                                      approval_callback=None,
-                                     *, smart_denied: bool = False) -> str:
+                                     *, smart_denied: bool = False,
+                                     once_only: bool = False,
+                                     redact_command: bool = True) -> str:
     # Redact secrets before any user-visible rendering. The original
     # `command` is still what executes after approval; only the displayed
     # copy is scrubbed. Reuses the same redaction module used for memory
     # and log sanitization so tokens mask consistently across surfaces.
     from agent.redact import redact_sensitive_text
-    display_command = redact_sensitive_text(command)
+    display_command = (
+        redact_sensitive_text(command) if redact_command else command
+    )
     display_description = redact_sensitive_text(description)
 
     if approval_callback is not None:
@@ -2766,6 +2803,8 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
             callback_kwargs = {"allow_permanent": allow_permanent}
             if smart_denied:
                 callback_kwargs["smart_denied"] = True
+            if once_only:
+                callback_kwargs["once_only"] = True
             return approval_callback(
                 display_command, display_description, **callback_kwargs
             )
@@ -2810,7 +2849,7 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
             print(f"  {t('approval.dangerous_header', description=display_description)}")
             print(f"      {display_command}")
             print()
-            if smart_denied:
+            if smart_denied or once_only:
                 print(t("approval.choose_smart_deny"))
             elif allow_permanent:
                 print(t("approval.choose_long"))
@@ -2823,7 +2862,7 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
 
             def get_input():
                 try:
-                    if smart_denied:
+                    if smart_denied or once_only:
                         prompt = t("approval.prompt_smart_deny")
                     else:
                         prompt = t("approval.prompt_long") if allow_permanent else t("approval.prompt_short")
@@ -2843,7 +2882,7 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
                 return "timeout"
 
             choice = result["choice"]
-            if smart_denied:
+            if smart_denied or once_only:
                 choice_map = {
                     **{
                         value: "once"
@@ -3617,6 +3656,10 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     the final tool-facing result dict remain the caller's responsibility.
     """
     command = approval_data.get("command", "")
+    # Some approval payloads (notably URL-mode MCP elicitation) must show a
+    # full value to the user but must not copy that value into plugin/audit
+    # hooks. Callers provide a query-free, non-sensitive representation.
+    audit_command = approval_data.get("audit_command", command)
     description = approval_data.get("description", "")
     primary_key = approval_data.get("pattern_key", "")
     all_keys = approval_data.get("pattern_keys", [primary_key])
@@ -3637,7 +3680,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     # gateway notify callback so observers get the event in real time.
     _fire_approval_hook(
         "pre_approval_request",
-        command=command,
+        command=audit_command,
         description=description,
         pattern_key=primary_key,
         pattern_keys=list(all_keys),
@@ -3653,7 +3696,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         _drop_entry()
         _fire_approval_hook(
             "post_approval_response",
-            command=command,
+            command=audit_command,
             description=description,
             pattern_key=primary_key,
             pattern_keys=list(all_keys),
@@ -3720,7 +3763,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     _outcome = "timeout" if not resolved else (choice if choice else "timeout")
     _fire_approval_hook(
         "post_approval_response",
-        command=command,
+        command=audit_command,
         description=description,
         pattern_key=primary_key,
         pattern_keys=list(all_keys),
@@ -4462,12 +4505,70 @@ def check_execute_code_guard(code: str, env_type: str,
 # MCP elicitation entry point
 # =========================================================================
 
+def _open_external_elicitation_url(url: str) -> bool:
+    """Launch a validated MCP URL without a shell or browser-controller API.
+
+    ``webbrowser.open`` can report success even when the selected controller
+    later fails, and some controllers build shell command strings. Resolve a
+    small platform opener explicitly and pass the URL as exactly one argv
+    element instead.
+    """
+    try:
+        from tools.mcp_tool import _validate_elicitation_url
+
+        safe_url = _validate_elicitation_url(url)
+    except Exception as exc:
+        logger.warning("MCP URL opener rejected the target: %s", exc)
+        return False
+
+    if sys.platform == "darwin":
+        executable = "open"
+    elif sys.platform == "win32":
+        executable = "explorer.exe"
+    else:
+        release = ""
+        try:
+            release = os.uname().release.lower()
+        except (AttributeError, OSError):
+            pass
+        executable = (
+            "explorer.exe"
+            if os.getenv("WSL_DISTRO_NAME") or "microsoft" in release
+            else "xdg-open"
+        )
+
+    resolved_executable = shutil.which(executable)
+    if resolved_executable is None:
+        logger.warning("MCP URL opener %s is unavailable", executable)
+        return False
+
+    try:
+        process_kwargs = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "close_fds": True,
+        }
+        if sys.platform != "win32":
+            process_kwargs["start_new_session"] = True
+        subprocess.Popen(
+            [resolved_executable, safe_url],
+            **process_kwargs,
+        )
+        return True
+    except (OSError, ValueError) as exc:
+        logger.error("URL elicitation browser launch failed: %s", exc)
+        return False
+
 def request_elicitation_consent(
     message: str,
     description: str,
     *,
     timeout_seconds: int | None = None,
     surface: str = "mcp-elicitation",
+    url: str | None = None,
+    server_name: str | None = None,
+    approval_callback=None,
 ) -> str:
     """Route an MCP elicitation request to whichever approval surface owns
     the active session and return a normalized result.
@@ -4481,8 +4582,22 @@ def request_elicitation_consent(
     and exceptions all map to ``"decline"`` so a server treats them as
     "user did not approve" rather than retrying or hanging.
 
+    For URL mode, ``url`` is displayed in full before the one-shot decision.
+    After consent it is presented to the host surface (external browser for a
+    local CLI, a post-consent event for TUI/API, or a link for messaging
+    gateways). The URL never enters the model response or plugin hooks.
+
     Returns one of ``"accept" | "decline" | "cancel"``.
     """
+    if url is not None:
+        try:
+            from tools.mcp_tool import _validate_elicitation_url
+
+            url = _validate_elicitation_url(url)
+        except Exception as exc:
+            logger.warning("Elicitation URL rejected before presentation: %s", exc)
+            return "decline"
+
     try:
         session_key = get_current_session_key()
     except Exception as exc:  # pragma: no cover -- defensive
@@ -4500,12 +4615,24 @@ def request_elicitation_consent(
             )
             return "decline"
 
+        is_url_mode = url is not None
         approval_data = {
-            "command": message,
+            "command": url if is_url_mode else message,
             "description": description,
             "pattern_key": "mcp_elicitation",
             "pattern_keys": ["mcp_elicitation"],
         }
+        if is_url_mode:
+            approval_data.update({
+                "allow_permanent": False,
+                "allow_session": False,
+                "audit_command": (
+                    f"MCP URL elicitation requested by {server_name or 'unknown server'}"
+                ),
+                "choices": ["once", "deny"],
+                "elicitation_mode": "url",
+                "server_name": server_name or "unknown server",
+            })
         try:
             decision = _await_gateway_decision(
                 session_key, notify_cb, approval_data, surface=surface,
@@ -4521,18 +4648,37 @@ def request_elicitation_consent(
         if not decision.get("resolved"):
             return "cancel"
         choice = decision.get("choice")
-        if choice in ("once", "session", "always"):
+        if is_url_mode and choice == "once":
+            try:
+                notify_cb({
+                    "kind": "mcp.elicitation.url",
+                    "message": message,
+                    "server_name": server_name or "unknown server",
+                    "url": url,
+                })
+            except Exception as exc:
+                logger.error(
+                    "URL elicitation presentation failed: %s", exc,
+                    exc_info=True,
+                )
+                return "cancel"
+            return "accept"
+        if not is_url_mode and choice in ("once", "session", "always"):
             return "accept"
         return "decline"
 
-    # CLI / TUI path. allow_permanent=False because elicitation is a
-    # per-call confirmation — there is no pattern to remember.
+    # CLI path. The callback is captured by the MCP tool wrapper before the
+    # request crosses onto the MCP background loop; without it prompt_toolkit
+    # would own stdin while this worker attempted an invisible input().
     try:
         choice = prompt_dangerous_approval(
-            message,
+            url if url is not None else message,
             description,
             timeout_seconds=timeout_seconds,
             allow_permanent=False,
+            approval_callback=approval_callback,
+            once_only=url is not None,
+            redact_command=url is None,
         )
     except Exception as exc:
         logger.error(
@@ -4540,7 +4686,11 @@ def request_elicitation_consent(
         )
         return "decline"
 
-    if choice in ("once", "session", "always"):
+    if url is not None and choice == "once":
+        if _open_external_elicitation_url(url):
+            return "accept"
+        return "cancel"
+    if url is None and choice in ("once", "session", "always"):
         return "accept"
     if choice == "timeout":
         # Prompt expired without a user response — mirror the gateway's

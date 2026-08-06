@@ -19,8 +19,12 @@ pytest.importorskip("mcp.types")
 from mcp.types import ElicitResult  # noqa: E402  -- after importorskip
 
 from tools.mcp_tool import (  # noqa: E402
+    ElicitationURLValidationError,
     ElicitationHandler,
+    _elicitation_url_origin,
     _format_elicitation_schema_summary,
+    _format_url_elicitation_description,
+    _validate_elicitation_url,
 )
 
 
@@ -68,6 +72,66 @@ class TestSchemaSummary:
         assert "recipient (string)" in out
 
 
+class TestURLValidation:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://example.com/connect?state=abc123",
+            "http://localhost:8765/callback",
+            "http://127.0.0.1:8765/callback",
+            "http://[::1]:8765/callback",
+        ],
+    )
+    def test_accepts_https_and_loopback_http(self, url):
+        assert _validate_elicitation_url(url) == url
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://example.com/connect",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "https://user:pass@example.com/connect",
+            "https://example.com/connect\nX-Injected: yes",
+            "https://example.com/`break-markdown`",
+            "https://example.com/connect\u200bspoofed",
+            "https://example.com/connect\u202eevil",
+            " https://example.com/connect",
+            "https://example.com/" + "x" * 2049,
+        ],
+    )
+    def test_rejects_unsafe_targets(self, url):
+        with pytest.raises(ElicitationURLValidationError):
+            _validate_elicitation_url(url)
+
+    def test_origin_omits_query_and_default_port(self):
+        assert (
+            _elicitation_url_origin("https://example.com:443/connect?state=secret")
+            == "https://example.com"
+        )
+
+    def test_description_identifies_server_host_and_punycode(self):
+        out = _format_url_elicitation_description(
+            "Authorize the workspace action",
+            "https://xn--exmple-cua.test/connect",
+            "workspace",
+        )
+        assert "workspace" in out
+        assert "xn--exmple-cua.test" in out
+        assert "Punycode" in out
+
+    def test_description_neutralizes_server_markup_and_mentions(self):
+        out = _format_url_elicitation_description(
+            "Approve <@everyone> [click](https://evil.test)",
+            "https://auth.example.test/connect",
+            "workspace`<!channel>",
+        )
+
+        assert "@everyone" not in out
+        assert "<!channel>" not in out
+        assert "[click](" not in out
+
+
 class TestElicitationHandlerFormMode:
     def test_user_accepts_once_returns_accept(self):
         handler = ElicitationHandler("pay", {"timeout": 5})
@@ -102,20 +166,42 @@ class TestElicitationHandlerFormMode:
 
 
 class TestElicitationHandlerFailureModes:
-    def test_url_mode_is_declined_without_prompting(self):
+    def test_url_mode_opens_only_through_one_shot_consent(self):
         handler = ElicitationHandler("pay", {"timeout": 5})
-        params = _url_params()
+        url = "https://example.com/auth?state=opaque"
+        params = _url_params(url=url)
 
-        # If the handler tried to prompt, this would raise AssertionError
-        # because the side_effect treats the call as a test failure.
-        with patch(
-            "tools.approval.request_elicitation_consent",
-            side_effect=AssertionError("URL mode must not prompt"),
-        ):
+        with patch("tools.approval.request_elicitation_consent", return_value="accept") as consent:
             result = asyncio.run(handler(context=None, params=params))
 
+        assert result.action == "accept"
+        assert result.content is None
+        assert handler.metrics["accepted"] == 1
+        assert consent.call_args.kwargs["url"] == url
+        assert consent.call_args.kwargs["server_name"] == "pay"
+
+    def test_url_mode_decline_propagates_without_content(self):
+        handler = ElicitationHandler("pay", {"timeout": 5})
+
+        with patch("tools.approval.request_elicitation_consent", return_value="decline"):
+            result = asyncio.run(handler(context=None, params=_url_params()))
+
         assert result.action == "decline"
+        assert result.content is None
         assert handler.metrics["declined"] == 1
+
+    def test_invalid_url_is_declined_without_prompting_or_logging_query(self, caplog):
+        handler = ElicitationHandler("pay", {"timeout": 5})
+        raw = "https://user:pass@example.com/connect?state=do-not-log"
+
+        with patch(
+            "tools.approval.request_elicitation_consent",
+            side_effect=AssertionError("invalid URL must not prompt"),
+        ):
+            result = asyncio.run(handler(context=None, params=_url_params(url=raw)))
+
+        assert result.action == "decline"
+        assert "do-not-log" not in caplog.text
 
     def test_exception_in_approval_fails_closed_to_decline(self):
         handler = ElicitationHandler("pay", {"timeout": 5})

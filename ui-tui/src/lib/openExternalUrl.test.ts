@@ -3,7 +3,13 @@ import { EventEmitter } from 'node:events'
 
 import { describe, expect, it, vi } from 'vitest'
 
-import { openCommand, openExternalUrl, parseSafeUrl } from './openExternalUrl.js'
+import {
+  openCommand,
+  openExternalUrl,
+  openMcpElicitationUrl,
+  parseSafeMcpElicitationUrl,
+  parseSafeUrl
+} from './openExternalUrl.js'
 
 type SpawnLike = typeof SpawnFn
 
@@ -70,6 +76,22 @@ describe('openCommand', () => {
     expect(openCommand('cygwin')).toBeNull()
     expect(openCommand('haiku')).toBeNull()
     expect(openCommand('')).toBeNull()
+  })
+})
+
+describe('parseSafeMcpElicitationUrl', () => {
+  it('accepts HTTPS and loopback HTTP', () => {
+    expect(parseSafeMcpElicitationUrl('https://auth.example.test/connect')?.hostname).toBe('auth.example.test')
+    expect(parseSafeMcpElicitationUrl('http://localhost:8787/callback')?.hostname).toBe('localhost')
+    expect(parseSafeMcpElicitationUrl('http://127.0.0.2/callback')?.hostname).toBe('127.0.0.2')
+    expect(parseSafeMcpElicitationUrl('http://[::1]/callback')?.hostname).toBe('[::1]')
+  })
+
+  it('rejects public HTTP, userinfo, whitespace, and oversized URLs', () => {
+    expect(parseSafeMcpElicitationUrl('http://example.test/connect')).toBeNull()
+    expect(parseSafeMcpElicitationUrl('https://user:secret@example.test/connect')).toBeNull()
+    expect(parseSafeMcpElicitationUrl(' https://example.test/connect')).toBeNull()
+    expect(parseSafeMcpElicitationUrl(`https://example.test/${'a'.repeat(2049)}`)).toBeNull()
   })
 })
 
@@ -213,5 +235,64 @@ describe('openExternalUrl', () => {
     // Emit and assert it doesn't throw. If the listener weren't attached,
     // this would throw 'Unhandled error' and fail the test.
     expect(() => child!.emit('error', new Error('ENOENT: xdg-open not found'))).not.toThrow()
+  })
+})
+
+describe('openMcpElicitationUrl', () => {
+  it('revalidates and forwards an approved URL as one shell-free argv element', () => {
+    const calls: Array<{ command: string; args: readonly string[] }> = []
+
+    const spawn = vi.fn((command: string, args: readonly string[]) => {
+      calls.push({ args, command })
+
+      const child = new EventEmitter() as EventEmitter & { unref: () => void }
+
+      child.unref = () => {}
+
+      return child as unknown as ChildProcess
+    }) as unknown as SpawnLike
+
+    const url = 'https://auth.example.test/connect?a=1&b=2%7Cwhoami'
+
+    expect(openMcpElicitationUrl(url, { platform: () => 'linux', spawn })).toBe(true)
+    expect(calls).toEqual([{ args: [url], command: 'xdg-open' }])
+  })
+
+  it('opens the exact approved bytes instead of URL-serializing them', () => {
+    const calls: Array<{ command: string; args: readonly string[] }> = []
+
+    const spawn = vi.fn((command: string, args: readonly string[]) => {
+      calls.push({ args, command })
+
+      const child = new EventEmitter() as EventEmitter & { unref: () => void }
+
+      child.unref = () => {}
+
+      return child as unknown as ChildProcess
+    }) as unknown as SpawnLike
+
+    const approved = 'https://auth.example.test'
+
+    expect(openMcpElicitationUrl(approved, { platform: () => 'linux', spawn })).toBe(true)
+    expect(calls[0]!.args).toEqual([approved])
+  })
+
+  it('does not spawn for a public HTTP URL', () => {
+    const spawn = vi.fn() as unknown as SpawnLike
+
+    expect(openMcpElicitationUrl('http://example.test/connect', { platform: () => 'linux', spawn })).toBe(false)
+    expect(spawn).not.toHaveBeenCalled()
+  })
+
+  it('rejects invisible and bidirectional formatting characters', () => {
+    const spawn = vi.fn() as unknown as SpawnLike
+
+    expect(openMcpElicitationUrl('https://example.test/connect\u200bspoofed', { platform: () => 'linux', spawn })).toBe(
+      false
+    )
+    expect(openMcpElicitationUrl('https://example.test/connect\u202eevil', { platform: () => 'linux', spawn })).toBe(
+      false
+    )
+    expect(spawn).not.toHaveBeenCalled()
   })
 })

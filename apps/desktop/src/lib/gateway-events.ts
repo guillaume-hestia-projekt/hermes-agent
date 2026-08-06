@@ -26,6 +26,7 @@ const UNSCOPED_STREAM_EVENT_TYPES = new Set([
   'message.delta',
   'message.interim',
   'message.start',
+  'mcp.elicitation.url',
   'reasoning.available',
   'reasoning.delta',
   'secret.request',

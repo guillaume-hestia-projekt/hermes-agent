@@ -76,6 +76,8 @@ export interface ApprovalRequest extends KeyedPrompt {
   choices?: string[]
   command: string
   description: string
+  elicitationMode?: 'url'
+  serverName?: string
   smartDenied?: boolean
 }
 

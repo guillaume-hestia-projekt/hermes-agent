@@ -67,6 +67,15 @@ def _make_background_cli_stub():
 
 
 class TestCliApprovalUi:
+    def test_once_only_callback_offers_only_once_and_deny(self):
+        cli = _make_cli_stub()
+
+        assert cli._approval_choices(
+            "https://auth.example.test/connect",
+            allow_permanent=False,
+            once_only=True,
+        ) == ["once", "deny"]
+
     def test_smart_denied_callback_offers_only_once_and_deny(self):
         cli = _make_cli_stub()
         result = {}
@@ -561,4 +570,3 @@ class TestClearOverlaysForInterrupt:
 
         assert not t.is_alive(), "worker thread never unblocked"
         assert result["value"] == "deny"
-

@@ -99,6 +99,7 @@ import contextvars
 import concurrent.futures
 import errno
 import fnmatch
+import ipaddress
 import inspect
 import json
 import logging
@@ -110,6 +111,7 @@ import shutil
 import sys
 import threading
 import time
+import unicodedata
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
@@ -1868,6 +1870,112 @@ class SamplingHandler:
 # Elicitation handler
 # ---------------------------------------------------------------------------
 
+_MAX_ELICITATION_URL_LENGTH = 2048
+
+
+class ElicitationURLValidationError(ValueError):
+    """Raised when a URL-mode elicitation target is unsafe to present."""
+
+
+def _validate_elicitation_url(value: Any) -> str:
+    """Validate an MCP URL-mode elicitation target without fetching it.
+
+    URL-mode is a navigation capability, so parsing must stay entirely local:
+    validation must never resolve DNS, prefetch the page, or inspect metadata.
+    Production targets require HTTPS. Plain HTTP is accepted only for literal
+    loopback hosts (plus ``localhost``) so local MCP development still works.
+    """
+    if not isinstance(value, str):
+        raise ElicitationURLValidationError("URL must be a string")
+    if not value or value != value.strip():
+        raise ElicitationURLValidationError("URL is empty or has surrounding whitespace")
+    if len(value) > _MAX_ELICITATION_URL_LENGTH:
+        raise ElicitationURLValidationError(
+            f"URL exceeds {_MAX_ELICITATION_URL_LENGTH} characters"
+        )
+    if any(ch in value for ch in "\\`<>") or any(
+        ch.isspace() or unicodedata.category(ch) in {"Cc", "Cf", "Zl", "Zp"}
+        for ch in value
+    ):
+        raise ElicitationURLValidationError("URL contains unsafe whitespace or control characters")
+
+    try:
+        parsed = urlparse(value)
+        # Accessing ``port`` performs validation that urlparse itself defers.
+        parsed.port
+    except (TypeError, ValueError) as exc:
+        raise ElicitationURLValidationError("URL is malformed") from exc
+
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise ElicitationURLValidationError("URL scheme must be HTTPS or loopback HTTP")
+    if not parsed.netloc or not parsed.hostname:
+        raise ElicitationURLValidationError("URL must include a host")
+    if parsed.username is not None or parsed.password is not None:
+        raise ElicitationURLValidationError("URL must not contain user information")
+
+    if scheme == "http":
+        hostname = parsed.hostname.rstrip(".").lower()
+        is_loopback = hostname == "localhost"
+        if not is_loopback:
+            try:
+                is_loopback = ipaddress.ip_address(hostname).is_loopback
+            except ValueError:
+                is_loopback = False
+        if not is_loopback:
+            raise ElicitationURLValidationError(
+                "plain HTTP is allowed only for localhost or a loopback IP"
+            )
+
+    return value
+
+
+def _elicitation_url_origin(url: str) -> str:
+    """Return a query-free origin for UI context and safe audit logging."""
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    default_port = 443 if parsed.scheme.lower() == "https" else 80
+    port = parsed.port
+    suffix = f":{port}" if port is not None and port != default_port else ""
+    return f"{parsed.scheme.lower()}://{host}{suffix}"
+
+
+def _format_url_elicitation_description(message: str, url: str, server_name: str) -> str:
+    """Build consent copy that identifies both requester and target host."""
+    parsed = urlparse(url)
+    host = parsed.hostname or "unknown host"
+    display_server = _safe_elicitation_display_text(
+        server_name, limit=200
+    ) or "unknown server"
+    display_message = _safe_elicitation_display_text(message, limit=1000)
+    lines = [
+        f"MCP server '{display_server}' wants to open an external page.",
+        f"Target host: {host}",
+    ]
+    try:
+        ascii_host = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        ascii_host = host
+    if ascii_host.lower() != host.lower() or any(
+        label.startswith("xn--") for label in ascii_host.lower().split(".")
+    ):
+        lines.append(
+            f"Warning: the target host uses an internationalized/Punycode name "
+            f"({ascii_host}); check it carefully."
+        )
+    if display_message:
+        lines.append(f"Reason: {display_message}")
+    return "\n".join(lines)
+
+
+def _safe_elicitation_display_text(value: Any, *, limit: int) -> str:
+    """Flatten untrusted MCP copy and neutralize chat markup/mentions."""
+    flattened = " ".join(str(value).split())[:limit]
+    unsafe_markup = set("<>@`*_~|&[]()\\")
+    return "".join("?" if ch in unsafe_markup else ch for ch in flattened)
+
 def _format_elicitation_schema_summary(schema: dict, server_name: str) -> str:
     """Render a JSON-schema-ish requested_schema to a human-readable field list.
 
@@ -1906,7 +2014,9 @@ class ElicitationHandler:
     Form-mode elicitations are routed through Hermes' existing approval
     system (``tools.approval.prompt_dangerous_approval``), which surfaces
     the prompt on whichever surface the active session uses -- CLI, TUI,
-    Telegram, Slack, etc. URL-mode elicitations are declined as unsupported.
+    Telegram, Slack, etc. URL-mode elicitations use the same consent boundary,
+    then open the validated URL outside Hermes so neither the model nor the MCP
+    client can inspect the resulting page or user input.
 
     Failure modes are fail-closed: any timeout, exception, or unexpected
     state returns ``decline``/``cancel`` rather than silently accepting.
@@ -1948,32 +2058,46 @@ class ElicitationHandler:
         """
         self.metrics["requests"] += 1
 
-        # URL-mode elicitations point the user to an external URL for
-        # sensitive out-of-band flows (OAuth, payment processing). Honouring
-        # them requires opening a browser to that URL and waiting for the
-        # server's notifications/elicitation/complete -- out of scope for
-        # the initial implementation. Decline cleanly so the server does
-        # not hang.
         mode = getattr(params, "mode", "form")
         if mode == "url":
-            logger.info(
-                "MCP server '%s' requested URL-mode elicitation; "
-                "declining (URL-mode elicitation not implemented)",
-                self.server_name,
+            try:
+                elicitation_url = _validate_elicitation_url(
+                    getattr(params, "url", None)
+                )
+            except ElicitationURLValidationError as exc:
+                # Never include the raw URL here: query parameters may contain
+                # state that belongs only on the human-facing approval surface.
+                logger.warning(
+                    "MCP server '%s' requested an invalid URL-mode elicitation: %s",
+                    self.server_name,
+                    exc,
+                )
+                self.metrics["declined"] += 1
+                return ElicitResult(action="decline")
+
+            message = getattr(params, "message", "") or (
+                f"MCP server '{self.server_name}' is requesting an external interaction"
             )
-            self.metrics["declined"] += 1
-            return ElicitResult(action="decline")
+            description = _format_url_elicitation_description(
+                message, elicitation_url, self.server_name
+            )
+            logger.info(
+                "MCP server '%s' requested URL-mode elicitation for origin %s",
+                self.server_name,
+                _elicitation_url_origin(elicitation_url),
+            )
+        else:
+            elicitation_url = None
+            message = getattr(params, "message", "") or (
+                f"MCP server '{self.server_name}' is requesting your approval"
+            )
+            schema = getattr(params, "requested_schema", {}) or {}
+            description = _format_elicitation_schema_summary(schema, self.server_name)
 
-        message = getattr(params, "message", "") or (
-            f"MCP server '{self.server_name}' is requesting your approval"
-        )
-        schema = getattr(params, "requested_schema", {}) or {}
-        description = _format_elicitation_schema_summary(schema, self.server_name)
-
-        logger.info(
-            "MCP server '%s' elicitation request: %s",
-            self.server_name, _sanitize_error(message)[:200],
-        )
+            logger.info(
+                "MCP server '%s' elicitation request: %s",
+                self.server_name, _sanitize_error(message)[:200],
+            )
 
         # Lazy import: tools.approval is imported very early during process
         # bootstrap; matching the lazy pattern used by _fire_approval_hook
@@ -2002,14 +2126,27 @@ class ElicitationHandler:
         # contextvars.Context.run so the gateway-platform detection in
         # request_elicitation_consent picks up the right session.
         captured = getattr(self.owner, "_pending_call_context", None) if self.owner else None
+        approval_callback = (
+            getattr(self.owner, "_pending_approval_callback", None)
+            if self.owner else None
+        )
 
         def _invoke_consent() -> str:
+            consent_kwargs = {
+                "approval_callback": approval_callback,
+                "timeout_seconds": int(self.timeout),
+                "surface": f"mcp-elicitation/{self.server_name}",
+            }
+            if elicitation_url is not None:
+                consent_kwargs.update({
+                    "url": elicitation_url,
+                    "server_name": self.server_name,
+                })
             if captured is None:
                 return request_elicitation_consent(
                     message,
                     description,
-                    timeout_seconds=int(self.timeout),
-                    surface=f"mcp-elicitation/{self.server_name}",
+                    **consent_kwargs,
                 )
             # Context.run can only execute a context once — copy to allow
             # multiple elicitations within a single tool call.
@@ -2017,8 +2154,7 @@ class ElicitationHandler:
                 request_elicitation_consent,
                 message,
                 description,
-                timeout_seconds=int(self.timeout),
-                surface=f"mcp-elicitation/{self.server_name}",
+                **consent_kwargs,
             )
 
         try:
@@ -2043,6 +2179,10 @@ class ElicitationHandler:
 
         if answer == "accept":
             self.metrics["accepted"] += 1
+            if elicitation_url is not None:
+                # URL-mode carries no in-band content. The sensitive
+                # interaction happens in the external browser.
+                return ElicitResult(action="accept")
             return ElicitResult(action="accept", content={})
         if answer == "cancel":
             self.metrics["errors"] += 1
@@ -2072,7 +2212,7 @@ class MCPServerTask:
         "_sampling", "_elicitation",
         "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
-        "_pending_call_context",
+        "_pending_call_context", "_pending_approval_callback",
         "_lifecycle_started_at", "_last_tool_call_at",
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
         "initialize_result", "_ping_unsupported",
@@ -2131,6 +2271,7 @@ class MCPServerTask:
         # gateway-platform attribution and routes the approval prompt
         # to the right surface (Telegram, Slack, etc.).
         self._pending_call_context: Optional[contextvars.Context] = None
+        self._pending_approval_callback: Optional[Callable[..., str]] = None
         now = time.monotonic()
         self._lifecycle_started_at: float = now
         self._last_tool_call_at: float = now
@@ -5399,6 +5540,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     )
                 return tool_error(f"MCP server '{server_name}' is not connected")
 
+        try:
+            from tools.terminal_tool import _get_approval_callback
+
+            captured_approval_callback = _get_approval_callback()
+        except Exception:
+            captured_approval_callback = None
+
         async def _call():
             _mark_server_call_started(server)
             async with server._rpc_lock:
@@ -5407,10 +5555,12 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # task, which doesn't inherit our contextvars) can replay
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
+                server._pending_approval_callback = captured_approval_callback
                 try:
                     result = await server.session.call_tool(tool_name, arguments=args)
                 finally:
                     server._pending_call_context = None
+                    server._pending_approval_callback = None
             # The RPC round-trip completed — the session is demonstrably
             # healthy at the transport level (even if the tool itself
             # returned isError). Clear the rapid-drop budget (#62212).

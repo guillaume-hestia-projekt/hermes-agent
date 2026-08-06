@@ -96,6 +96,29 @@ def _wait_until(predicate, timeout=30.0, interval=0.02):
     return result
 
 
+def test_mcp_url_messaging_capability_requires_approval_and_verbatim_delivery():
+    from gateway.run import _supports_mcp_url_elicitation
+
+    class CompleteAdapter:
+        supports_mcp_url_elicitation = True
+
+        async def send_exec_approval(self):
+            pass
+
+        async def send_mcp_elicitation_url(self):
+            pass
+
+    class MissingVerbatimDelivery:
+        supports_mcp_url_elicitation = True
+
+        async def send_exec_approval(self):
+            pass
+
+    assert _supports_mcp_url_elicitation(CompleteAdapter()) is True
+    assert _supports_mcp_url_elicitation(MissingVerbatimDelivery()) is False
+    assert _supports_mcp_url_elicitation(object()) is False
+
+
 # ------------------------------------------------------------------
 # Blocking gateway approval infrastructure (tools/approval.py)
 # ------------------------------------------------------------------
@@ -155,6 +178,22 @@ class TestBlockingGatewayApproval:
         assert e1.result == "once"
         assert not e2.event.is_set()
         assert len(_gateway_queues[session_key]) == 1
+
+    def test_disallowed_persistent_choice_resolves_one_shot_prompt_as_deny(self):
+        """Typed approvals cannot widen a prompt's explicit choice set."""
+        from tools.approval import (
+            _ApprovalEntry,
+            _gateway_queues,
+            resolve_gateway_approval,
+        )
+
+        session_key = "test-one-shot"
+        entry = _ApprovalEntry({"command": "https://example.test", "choices": ["once", "deny"]})
+        _gateway_queues[session_key] = [entry]
+
+        assert resolve_gateway_approval(session_key, "session") == 0
+        assert entry.event.is_set()
+        assert entry.result == "deny"
 
 
 # ------------------------------------------------------------------

@@ -1582,8 +1582,8 @@ class TelegramAdapter(BasePlatformAdapter):
             parsed = min(parsed, max_value)
         return parsed
 
-    def _link_preview_kwargs(self) -> Dict[str, Any]:
-        if not getattr(self, "_disable_link_previews", False):
+    def _link_preview_kwargs(self, *, force_disable: bool = False) -> Dict[str, Any]:
+        if not force_disable and not getattr(self, "_disable_link_previews", False):
             return {}
         if LinkPreviewOptions is not None:
             return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
@@ -1721,6 +1721,7 @@ class TelegramAdapter(BasePlatformAdapter):
     ) -> bool:
         return bool(
             not (metadata or {}).get("expect_edits")
+            and not (metadata or {}).get("suppress_link_preview")
             and self._rich_eligible(content)
         )
 
@@ -4572,6 +4573,12 @@ class TelegramAdapter(BasePlatformAdapter):
             chunks = self.truncate_message(
                 formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
             )
+            if (metadata or {}).get("require_full_content") and len(chunks) != 1:
+                return SendResult(
+                    success=False,
+                    error="Message cannot be displayed in full on Telegram",
+                    retryable=False,
+                )
             if len(chunks) > 1:
                 # truncate_message appends a raw " (1/2)" suffix. Escape the
                 # MarkdownV2-special parentheses so Telegram doesn't reject the
@@ -4657,7 +4664,11 @@ class TelegramAdapter(BasePlatformAdapter):
                                 parse_mode=ParseMode.MARKDOWN_V2,
                                 reply_to_message_id=reply_to_id,
                                 **thread_kwargs,
-                                **self._link_preview_kwargs(),
+                                **self._link_preview_kwargs(
+                                    force_disable=bool(
+                                        (metadata or {}).get("suppress_link_preview")
+                                    )
+                                ),
                                 **self._notification_kwargs(metadata),
                             )
                         except Exception as md_error:
@@ -4671,7 +4682,11 @@ class TelegramAdapter(BasePlatformAdapter):
                                     parse_mode=None,
                                     reply_to_message_id=reply_to_id,
                                     **thread_kwargs,
-                                    **self._link_preview_kwargs(),
+                                    **self._link_preview_kwargs(
+                                        force_disable=bool(
+                                            (metadata or {}).get("suppress_link_preview")
+                                        )
+                                    ),
                                     **self._notification_kwargs(metadata),
                                 )
                             else:
@@ -5545,9 +5560,57 @@ class TelegramAdapter(BasePlatformAdapter):
     _EA_CODE_CLOSE = "</pre>\n\n"
     _EA_SMART_DENY_LINE = "\n\n<b>Smart DENY:</b> owner override applies to this one operation only."
     _EA_CMD_BUDGET = 3800
+    supports_mcp_url_elicitation = True
 
     def _ea_escape(self, text: str) -> str:
         return _html.escape(text)
+
+    async def send_mcp_elicitation_url(
+        self,
+        *,
+        chat_id: str,
+        url: str,
+        server_name: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Deliver the approved URL verbatim without Markdown rewriting."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        text = f"Open the external page requested by MCP server {server_name}:\n{url}"
+        if utf16_len(text) > self.MAX_MESSAGE_LENGTH:
+            return SendResult(
+                success=False,
+                error="MCP URL cannot be delivered in full on Telegram",
+                retryable=False,
+            )
+
+        try:
+            thread_id = self._metadata_thread_id(metadata)
+            reply_to_id = self._reply_to_message_id_for_send(
+                None,
+                metadata,
+                reply_to_mode=self._reply_to_mode,
+            )
+            msg = await self._send_message_with_thread_fallback(
+                chat_id=normalize_telegram_chat_id(chat_id),
+                text=text,
+                parse_mode=None,
+                reply_to_message_id=reply_to_id,
+                **self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                    reply_to_mode=self._reply_to_mode,
+                ),
+                **self._link_preview_kwargs(force_disable=True),
+            )
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as exc:
+            error = _redact_telegram_error_text(exc)
+            logger.warning("[%s] MCP URL delivery failed: %s", self.name, error)
+            return SendResult(success=False, error=error)
 
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
@@ -5566,7 +5629,25 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
+            if (
+                (metadata or {}).get("require_full_command")
+                and len(str(command or "")) > self._EA_CMD_BUDGET
+            ):
+                return SendResult(
+                    success=False,
+                    error="Approval URL cannot be displayed in full on Telegram",
+                    retryable=False,
+                )
             text = self._format_exec_approval(command, description, smart_denied)
+            if (
+                (metadata or {}).get("require_full_command")
+                and utf16_len(text) > self.MAX_MESSAGE_LENGTH
+            ):
+                return SendResult(
+                    success=False,
+                    error="Approval URL cannot be displayed in full on Telegram",
+                    retryable=False,
+                )
 
             # Resolve thread context for thread replies
             thread_id = self._metadata_thread_id(metadata)
@@ -5601,7 +5682,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 "text": text,
                 "parse_mode": ParseMode.HTML,
                 "reply_markup": keyboard,
-                **self._link_preview_kwargs(),
+                **self._link_preview_kwargs(
+                    force_disable=bool(
+                        (metadata or {}).get("suppress_link_preview")
+                    )
+                ),
             }
             reply_to_id = self._reply_to_message_id_for_send(None, metadata, reply_to_mode=self._reply_to_mode)
             kwargs["reply_to_message_id"] = reply_to_id

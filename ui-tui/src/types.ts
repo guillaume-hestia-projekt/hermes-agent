@@ -95,6 +95,8 @@ export interface ApprovalReq {
   choices?: string[]
   command: string
   description: string
+  elicitationMode?: 'url'
+  serverName?: string
   smartDenied?: boolean
 }
 

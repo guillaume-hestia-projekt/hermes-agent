@@ -16,7 +16,7 @@ import type {
 import { billingDialogCopy } from '../lib/billingDialog.js'
 import { relativeLuminance } from '../lib/color.js'
 import { isTodoDone } from '../lib/liveProgress.js'
-import { openExternalUrl } from '../lib/openExternalUrl.js'
+import { openExternalUrl, openMcpElicitationUrl } from '../lib/openExternalUrl.js'
 import { rpcErrorMessage } from '../lib/rpc.js'
 import { topLevelSubagents } from '../lib/subagentTree.js'
 import { isPaintableHex, setTerminalBackground, setTerminalForeground } from '../lib/terminalModes.js'
@@ -1177,6 +1177,8 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
             choices: ev.payload.choices,
             command: String(ev.payload.command ?? ''),
             description,
+            elicitationMode: ev.payload.elicitation_mode,
+            serverName: ev.payload.server_name,
             smartDenied: ev.payload.smart_denied === true
           }
         })
@@ -1184,6 +1186,13 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         return
       }
+
+      case 'mcp.elicitation.url':
+        // The backend emits this event only after resolving the explicit
+        // one-shot approval. Never open from approval.request itself.
+        void openMcpElicitationUrl(ev.payload.url)
+
+        return
 
       case 'sudo.request':
         patchOverlayState({ sudo: { requestId: ev.payload.request_id } })

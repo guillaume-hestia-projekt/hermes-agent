@@ -6620,11 +6620,28 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
                     event = dict(approval_data or {})
+                    if event.get("kind") == "mcp.elicitation.url":
+                        # A distinct post-consent event keeps browser
+                        # navigation impossible while the approval is merely
+                        # being rendered. The API client owns secure opening.
+                        event.update({
+                            "event": "mcp.elicitation.url",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                        })
+                        # A closed event loop must propagate back through the
+                        # approval presenter so URL mode returns cancel, not a
+                        # false accept. The queue is intentionally unbounded.
+                        loop.call_soon_threadsafe(q.put_nowait, event)
+                        return
                     # Redact credentials from the command before it enters the
                     # SSE/API event stream — same egress bug as #48456, second
                     # transport: API/desktop clients would otherwise receive the
                     # raw command Tirith flagged. Reuse the gateway seam.
-                    if "command" in event:
+                    if (
+                        "command" in event
+                        and event.get("elicitation_mode") != "url"
+                    ):
                         from gateway.run import _redact_approval_command
 
                         event["command"] = _redact_approval_command(event.get("command"))
@@ -6632,7 +6649,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "event": "approval.request",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                        "choices": _approval_event_choices(
+                        "choices": event.get("choices") or _approval_event_choices(
                             smart_denied=bool(event.get("smart_denied")),
                             allow_permanent=event.get("allow_permanent") is not False,
                         ),

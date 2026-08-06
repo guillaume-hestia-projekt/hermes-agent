@@ -190,6 +190,117 @@ class TestStartRun:
             "runs route must bind chat_id so delegation dispatch sees a wake target"
         )
 
+    @pytest.mark.asyncio
+    async def test_url_elicitation_requires_once_then_emits_browser_event(self, adapter):
+        """Exercise the API/Desktop seam with an auth-app-shaped URL."""
+        app = _create_runs_app(adapter)
+        captured = {}
+        url = (
+            "https://auth.workspace.test/authorize"
+            "?client_id=hermes&state=opaque-once"
+        )
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+
+                def _run_with_elicitation(**_kwargs):
+                    captured["decision"] = approval_mod.request_elicitation_consent(
+                        "Authorize the frozen Workspace action",
+                        "MCP server workspace requested an external authorization",
+                        url=url,
+                        server_name="workspace",
+                    )
+                    return {"final_response": "authorization handed to browser"}
+
+                mock_agent.run_conversation.side_effect = _run_with_elicitation
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                start = await cli.post("/v1/runs", json={"input": "authorize action"})
+                assert start.status == 202
+                run_id = (await start.json())["run_id"]
+                queue = adapter._run_streams[run_id]
+
+                approval_event = await asyncio.wait_for(queue.get(), timeout=3)
+                assert approval_event["event"] == "approval.request"
+                assert approval_event["choices"] == ["once", "deny"]
+                assert approval_event["command"] == url
+                assert approval_event["server_name"] == "workspace"
+
+                approved = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={"choice": "once"},
+                )
+                assert approved.status == 200
+
+                browser_event = await asyncio.wait_for(queue.get(), timeout=3)
+                if browser_event["event"] == "approval.responded":
+                    browser_event = await asyncio.wait_for(queue.get(), timeout=3)
+                assert browser_event["event"] == "mcp.elicitation.url"
+                assert browser_event["url"] == url
+
+                for _ in range(60):
+                    if captured.get("decision") == "accept":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert captured["decision"] == "accept"
+
+    @pytest.mark.asyncio
+    async def test_url_elicitation_rejects_disallowed_session_choice(self, adapter):
+        app = _create_runs_app(adapter)
+        captured = {}
+        url = "https://auth.workspace.test/authorize?state=opaque-once"
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+
+                def _run_with_elicitation(**_kwargs):
+                    captured["decision"] = approval_mod.request_elicitation_consent(
+                        "Authorize the frozen Workspace action",
+                        "MCP server workspace requested authorization",
+                        url=url,
+                        server_name="workspace",
+                    )
+                    return {"final_response": "authorization declined"}
+
+                mock_agent.run_conversation.side_effect = _run_with_elicitation
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                start = await cli.post("/v1/runs", json={"input": "authorize action"})
+                run_id = (await start.json())["run_id"]
+                queue = adapter._run_streams[run_id]
+                approval_event = await asyncio.wait_for(queue.get(), timeout=3)
+
+                assert approval_event["choices"] == ["once", "deny"]
+                rejected = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={"choice": "session"},
+                )
+                assert rejected.status == 409
+
+                for _ in range(60):
+                    if captured.get("decision") == "decline":
+                        break
+                    await asyncio.sleep(0.05)
+
+                queued_events = []
+                while not queue.empty():
+                    queued_events.append(queue.get_nowait())
+
+        assert captured["decision"] == "decline"
+        assert not any(
+            event and event.get("event") == "mcp.elicitation.url"
+            for event in queued_events
+        )
+
 
     @pytest.mark.asyncio
     async def test_start_rejects_conflicting_route_and_request_provider(self):

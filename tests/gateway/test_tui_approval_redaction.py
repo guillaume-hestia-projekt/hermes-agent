@@ -34,4 +34,59 @@ class TestTuiApprovalEmitRedaction:
         assert emitted["payload"]["description"] == "x"
         assert "github.com" in emitted["payload"]["command"]
 
+    def test_url_mode_keeps_full_target_for_pre_consent_review(self, monkeypatch):
+        from tui_gateway import server as tui_server
+
+        emitted = {}
+        monkeypatch.setattr(
+            tui_server, "_emit",
+            lambda event, sid, payload=None: emitted.update(
+                {"event": event, "sid": sid, "payload": payload}
+            ),
+        )
+        url = "https://auth.example.test/connect?state=opaque"
+        tui_server._emit_approval_request(
+            "sess-1",
+            {
+                "choices": ["once", "deny"],
+                "command": url,
+                "description": "Target host: auth.example.test",
+                "elicitation_mode": "url",
+                "server_name": "workspace",
+            },
+        )
+
+        assert emitted["event"] == "approval.request"
+        assert emitted["payload"]["command"] == url
+        assert emitted["payload"]["choices"] == ["once", "deny"]
+
+    def test_post_consent_url_uses_distinct_navigation_event(self, monkeypatch):
+        from tui_gateway import server as tui_server
+
+        emitted = {}
+        monkeypatch.setattr(
+            tui_server, "_emit",
+            lambda event, sid, payload=None: emitted.update(
+                {"event": event, "sid": sid, "payload": payload}
+            ),
+        )
+        tui_server._emit_approval_request(
+            "sess-1",
+            {
+                "kind": "mcp.elicitation.url",
+                "message": "Authorize",
+                "server_name": "workspace",
+                "url": "https://auth.example.test/connect?state=opaque",
+            },
+        )
+
+        assert emitted == {
+            "event": "mcp.elicitation.url",
+            "sid": "sess-1",
+            "payload": {
+                "message": "Authorize",
+                "server_name": "workspace",
+                "url": "https://auth.example.test/connect?state=opaque",
+            },
+        }
 

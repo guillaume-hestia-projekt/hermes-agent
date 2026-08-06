@@ -37,6 +37,23 @@ export function openExternalUrl(rawUrl: string, dependencies: OpenDependencies =
     return false
   }
 
+  return openValidatedUrl(url.toString(), dependencies)
+}
+
+/** Open an MCP URL only after applying the protocol's stricter URL policy. */
+export function openMcpElicitationUrl(rawUrl: string, dependencies: OpenDependencies = {}): boolean {
+  const url = parseSafeMcpElicitationUrl(rawUrl)
+
+  if (!url) {
+    return false
+  }
+
+  // The user approved this exact byte string. Parsing is validation only;
+  // URL serialization must not silently change the target after consent.
+  return openValidatedUrl(rawUrl, dependencies)
+}
+
+function openValidatedUrl(url: string, dependencies: OpenDependencies): boolean {
   const spawnFn = dependencies.spawn ?? spawn
   const platformId = dependencies.platform?.() ?? platform()
 
@@ -47,7 +64,7 @@ export function openExternalUrl(rawUrl: string, dependencies: OpenDependencies =
   }
 
   try {
-    const child = spawnFn(command.command, [...command.args, url.toString()], {
+    const child = spawnFn(command.command, [...command.args, url], {
       // Detach so closing the TUI later doesn't kill the browser process,
       // and ignore stdio so we don't leak FDs into our raw-mode terminal.
       // Without `ignore` here, Chrome's stderr can land in the alt screen.
@@ -116,6 +133,49 @@ export function parseSafeUrl(value: string): null | URL {
   }
 
   return parsed
+}
+
+/** Validate URL-mode elicitation again at the native-open seam. */
+export function parseSafeMcpElicitationUrl(value: string): null | URL {
+  if (
+    typeof value !== 'string' ||
+    !value ||
+    value !== value.trim() ||
+    value.length > 2048 ||
+    hasUnsafeMcpUrlCharacter(value)
+  ) {
+    return null
+  }
+
+  const parsed = parseSafeUrl(value)
+
+  if (!parsed || parsed.username || parsed.password) {
+    return null
+  }
+
+  if (parsed.protocol === 'http:' && !isLoopbackHostname(parsed.hostname)) {
+    return null
+  }
+
+  return parsed
+}
+
+function hasUnsafeMcpUrlCharacter(value: string): boolean {
+  return /[\\`<>\s\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value)
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, '')
+
+  if (normalized === 'localhost' || normalized === '::1') {
+    return true
+  }
+
+  const octets = normalized.split('.')
+
+  return (
+    octets.length === 4 && octets[0] === '127' && octets.every(octet => /^\d{1,3}$/.test(octet) && Number(octet) <= 255)
+  )
 }
 
 type OpenCommand = { command: string; args: readonly string[] }
